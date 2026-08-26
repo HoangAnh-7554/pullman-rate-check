@@ -21,6 +21,7 @@ EXCLUDE_KEYWORDS = [
     'amount', 'grand', 'net', 'visa', 'master', 'cash'
 ]
 
+# Danh sách các mã phòng thường gặp cơ bản (Đã update theo file Matrix)
 KNOWN_ROOM_TYPES = ['KGB', 'TWB', 'KGA', 'TWA', 'KGAEF', 'TWAEF', 'SKB', 'SKC', 'SKE', 'SKA', 'SUI', 'DLX', 'SUP', 'EXE', 'RB1', 'RB3']
 
 def get_report_date(full_text):
@@ -47,7 +48,9 @@ def get_report_date(full_text):
 def clean_rate(rate_str):
     if not rate_str: return 0
     s = str(rate_str).strip()
+    # Loại bỏ đuôi thập phân (ví dụ .00 hoặc ,00 ở cuối cùng)
     s = re.sub(r'[\.,]\d{2}$', '', s)
+    # Xóa mọi ký tự không phải số
     s = re.sub(r'[^\d]', '', s)
     if not s: return 0
     return int(s)
@@ -140,11 +143,11 @@ def check_line_condition(line, report_date):
     return 'NEUTRAL'
 
 # ==========================================
-# 3. TÌM GIÁ 
+# 3. TÌM GIÁ - BỔ SUNG ĐẾM MỨC GIÁ
 # ==========================================
 
 def extract_best_rate(comments, report_date, system_rate_val, room_type=None):
-    if not comments: return 0, "N/A"
+    if not comments: return 0, "N/A", 0
     lines = comments.split('\n')
     candidates = [] 
     
@@ -204,9 +207,13 @@ def extract_best_rate(comments, report_date, system_rate_val, room_type=None):
             if 100000 < val < 100000000:
                 candidates.append((val, raw, prio))
 
-    if not candidates: return 0, "N/A"
+    if not candidates: return 0, "N/A", 0
+    
+    # Tính số lượng mức giá ĐỘC LẬP (khác nhau)
+    unique_rates = set(val for val, raw, prio in candidates)
+    
     candidates.sort(key=lambda x: (x[2], x[0]), reverse=True)
-    return candidates[0][0], candidates[0][1]
+    return candidates[0][0], candidates[0][1], len(unique_rates)
 
 # ==========================================
 # 4. XỬ LÝ VÀ PHÂN TÍCH
@@ -250,9 +257,12 @@ def analyze_room_group(room_no, entries, report_date):
         if prs > 0 or adl > 0 or rate_val > 0:
             valued_lines.append((prs, adl, rate_val))
             
-    comm_val, comm_str = extract_best_rate(all_comments, report_date, system_rate_val, room_type)
+    comm_val, comm_str, num_unique_rates = extract_best_rate(all_comments, report_date, system_rate_val, room_type)
     
     errors = []
+    warning = ""
+    
+    # 1. Báo lỗi chênh lệch giá
     if system_rate_val > 0:
         if comm_val > 0: 
             if abs(system_rate_val - comm_val) > 10:
@@ -260,10 +270,21 @@ def analyze_room_group(room_no, entries, report_date):
         else:
             errors.append("Không tìm thấy rate hợp lệ trong Comments")
             
+    # 2. Báo lỗi Share
     if len(valued_lines) > 1:
         errors.append("Lỗi Share: Có Sharer bị dính giá (chọn nhầm Split) hoặc quên set Adults = 0")
         
-    status = "✅ OK" if not errors else "❌ " + " | ".join(errors)
+    # 3. Báo hiệu cảnh báo Check tay nếu có >= 2 mức giá
+    if num_unique_rates > 1:
+        warning = "⚠️ CẦN CHECK TAY: Comment có nhiều mức giá theo ngày/loại phòng"
+        
+    # 4. Gộp Status
+    if warning:
+        status = warning
+        if errors:
+            status += " | ❌ " + " | ".join(errors)
+    else:
+        status = "✅ OK" if not errors else "❌ " + " | ".join(errors)
     
     return {
         'Room No': room_no,
@@ -310,7 +331,7 @@ def process_pdf(pdf_file):
 
 st.set_page_config(page_title="Pullman VT - Rate Check Auto", page_icon="🏨", layout="wide")
 
-st.title("🏨 Pullman Vung Tau - Rate Check Automation V16")
+st.title("🏨 Pullman Vung Tau - Rate Check Automation V17")
 st.markdown("Công cụ tự động kiểm tra chênh lệch giá hệ thống và ghi chú (Reservation Comments) từ file PDF xuất từ Opera.")
 
 uploaded_file = st.file_uploader("Tải lên file báo cáo Rate Check (PDF)", type=["pdf"])
@@ -324,25 +345,26 @@ if uploaded_file is not None:
         else:
             st.success(f"✅ Hoàn tất! Đã quét {total_rooms} phòng. (Ngày báo cáo nhận diện: {report_date.strftime('%d-%m-%Y')})")
             
-            df_errors = df[df['Check Status'].str.contains('❌', na=False)]
+            # Lọc ra cả lỗi ❌ và cảnh báo ⚠️
+            df_attention = df[df['Check Status'] != '✅ OK']
             
             # Hiển thị số liệu thống kê
             col1, col2 = st.columns(2)
             col1.metric("Tổng số phòng", total_rooms)
-            col2.metric("Số phòng phát hiện lỗi", len(df_errors), delta_color="inverse")
+            col2.metric("Số phòng cần xử lý (Lỗi & Check Tay)", len(df_attention), delta_color="inverse")
             
-            st.markdown("### Danh sách các phòng có lỗi:")
-            if not df_errors.empty:
-                st.dataframe(df_errors, use_container_width=True)
+            st.markdown("### Danh sách các phòng cần xử lý:")
+            if not df_attention.empty:
+                st.dataframe(df_attention, use_container_width=True)
             else:
-                st.info("Tuyệt vời! Không có phòng nào bị lệch giá hoặc lỗi share.")
+                st.info("Tuyệt vời! Không có phòng nào bị lệch giá, lỗi share hoặc cần check tay.")
                 
             # Tạo file Excel trong bộ nhớ để tải về
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 df.to_excel(writer, sheet_name='Tất cả kết quả', index=False)
-                if not df_errors.empty:
-                    df_errors.to_excel(writer, sheet_name='Các phòng lỗi', index=False)
+                if not df_attention.empty:
+                    df_attention.to_excel(writer, sheet_name='Cần xử lý', index=False)
             processed_data = output.getvalue()
             
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
